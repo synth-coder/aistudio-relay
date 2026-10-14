@@ -77,15 +77,16 @@ jobs:
           echo "BIN_ABS=$BIN_ABS" >> "$GITHUB_ENV"
 
           cd aistudio-pro
-          # Patch environment without destructive clobber
+          # Patch environment non-destructively (F1: grep-or-add then unconditional sed)
           [ -f .env ] || touch .env
           grep -q "^AISTUDIO_PORT=" .env || echo "AISTUDIO_PORT=7865" >> .env
           grep -q "^AISTUDIO_HOST=" .env || echo "AISTUDIO_HOST=0.0.0.0" >> .env
           grep -q "^AISTUDIO_AUTH_STATES=" .env || echo "AISTUDIO_AUTH_STATES=auth" >> .env
           grep -q "^PROXY_API_KEY=" .env || echo "PROXY_API_KEY=123456" >> .env
           grep -q "^AUTO_START=" .env || echo "AUTO_START=true" >> .env
-          sed -i -E 's/^WAA_BACKEND=.*/WAA_BACKEND=camoufox/' .env || echo "WAA_BACKEND=camoufox" >> .env
-          sed -i -E 's/^UPSTREAM_CHANNELS=.*/UPSTREAM_CHANNELS=playground/' .env || echo "UPSTREAM_CHANNELS=playground" >> .env
+          grep -q "^WAA_BACKEND=" .env || echo "WAA_BACKEND=camoufox" >> .env
+          grep -q "^UPSTREAM_CHANNELS=" .env || echo "UPSTREAM_CHANNELS=playground" >> .env
+          sed -i -E 's/^WAA_BACKEND=.*/WAA_BACKEND=camoufox/; s/^UPSTREAM_CHANNELS=.*/UPSTREAM_CHANNELS=playground/' .env
 
           echo "Starting AIStudio2API with Camoufox in background..."
           nohup env -u CLONE_PAT -u GIT_PAT "$BIN_ABS" -listen 0.0.0.0:7865 -auth auth > aistudio.log 2>&1 &
@@ -123,6 +124,10 @@ jobs:
           NEXT_PAT: ${{ secrets.NEXT_PAT }}
         run: |
           set -euo pipefail
+          # F2: Terminate lingering partially-started process before handling secrets
+          [ -f server.pid ] && kill "$(cat server.pid)" 2>/dev/null || true
+          pkill -fi aistudio2api 2>/dev/null || true
+
           DEPTH="${{ github.event.inputs.retry_depth }}"
           DEPTH=${DEPTH:-0}
           echo "Pre-warming failed. Current circuit-breaker retry depth: $DEPTH"
@@ -149,16 +154,19 @@ jobs:
             -f test_handover="${{ github.event.inputs.test_handover }}" || true
           exit 1
 
+      - name: Install Cloudflare Daemon
+        run: |
+          set -euo pipefail
+          # F3: Secret-less installation step
+          curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | sudo tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null
+          echo "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflared.list
+          sudo apt-get update -qq && sudo apt-get install -y -qq cloudflared
+
       - name: Phase 2 - Cloudflare Tunnel Ingress Takeover
         env:
           CLOUDFLARE_TUNNEL_TOKEN: ${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}
         run: |
           set -euo pipefail
-          echo "Installing Cloudflare daemon..."
-          curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | sudo tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null
-          echo "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflared.list
-          sudo apt-get update -qq && sudo apt-get install -y -qq cloudflared
-
           echo "Starting cloudflared replica via root-owned token file..."
           sudo install -m 600 /dev/null /tmp/cf-token
           printf '%s' "$CLOUDFLARE_TUNNEL_TOKEN" | sudo tee /tmp/cf-token >/dev/null
@@ -342,7 +350,6 @@ jobs:
               -f cycle_count="$NEXT_CYCLE" -f retry_depth="0" -f test_handover="${TEST_MIN:-0}" || true
           fi
 
-          # Unset token as soon as dispatch phase is done
           unset NEXT_PAT || true
 
           echo "Entering 20-minute graceful handover standby (predecessor continues serving while successor warms up)..."
