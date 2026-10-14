@@ -77,16 +77,15 @@ jobs:
           echo "BIN_ABS=$BIN_ABS" >> "$GITHUB_ENV"
 
           cd aistudio-pro
-          # Ensure explicit environment isolation alongside binary arguments
-          cat > .env <<'ENVEOF'
-          AISTUDIO_PORT=7865
-          AISTUDIO_HOST=0.0.0.0
-          AISTUDIO_AUTH_STATES=auth
-          WAA_BACKEND=camoufox
-          PROXY_API_KEY=123456
-          AUTO_START=true
-          UPSTREAM_CHANNELS=playground
-          ENVEOF
+          # Patch environment without destructive clobber
+          [ -f .env ] || touch .env
+          grep -q "^AISTUDIO_PORT=" .env || echo "AISTUDIO_PORT=7865" >> .env
+          grep -q "^AISTUDIO_HOST=" .env || echo "AISTUDIO_HOST=0.0.0.0" >> .env
+          grep -q "^AISTUDIO_AUTH_STATES=" .env || echo "AISTUDIO_AUTH_STATES=auth" >> .env
+          grep -q "^PROXY_API_KEY=" .env || echo "PROXY_API_KEY=123456" >> .env
+          grep -q "^AUTO_START=" .env || echo "AUTO_START=true" >> .env
+          sed -i -E 's/^WAA_BACKEND=.*/WAA_BACKEND=camoufox/' .env || echo "WAA_BACKEND=camoufox" >> .env
+          sed -i -E 's/^UPSTREAM_CHANNELS=.*/UPSTREAM_CHANNELS=playground/' .env || echo "UPSTREAM_CHANNELS=playground" >> .env
 
           echo "Starting AIStudio2API with Camoufox in background..."
           nohup env -u CLONE_PAT -u GIT_PAT "$BIN_ABS" -listen 0.0.0.0:7865 -auth auth > aistudio.log 2>&1 &
@@ -102,7 +101,6 @@ jobs:
               WARM=true
               break
             elif [ "$HEALTH_CODE" = "401" ]; then
-              # 401 proves process is alive, listening, and auth middleware is active
               echo "AIStudio2API port is open and listening (HTTP 401)! Verified warm in $((i * 5))s."
               WARM=true
               break
@@ -161,12 +159,12 @@ jobs:
           echo "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflared.list
           sudo apt-get update -qq && sudo apt-get install -y -qq cloudflared
 
-          echo "Starting cloudflared replica via root-isolated token file..."
-          printf '%s' "$CLOUDFLARE_TUNNEL_TOKEN" > /tmp/cf-token
-          chmod 600 /tmp/cf-token
+          echo "Starting cloudflared replica via root-owned token file..."
+          sudo install -m 600 /dev/null /tmp/cf-token
+          printf '%s' "$CLOUDFLARE_TUNNEL_TOKEN" | sudo tee /tmp/cf-token >/dev/null
           unset CLOUDFLARE_TUNNEL_TOKEN
           sudo sh -c 'export TUNNEL_TOKEN="$(cat /tmp/cf-token)"; cloudflared tunnel run > cloudflared.log 2>&1 & echo $! > /tmp/cf.pid'
-          shred -u /tmp/cf-token 2>/dev/null || rm -f /tmp/cf-token
+          sudo shred -u /tmp/cf-token 2>/dev/null || sudo rm -f /tmp/cf-token
 
           echo "Verifying edge ingress routing via https://ai.silver-xf.bond..."
           EDGE_LIVE=false
@@ -211,10 +209,7 @@ jobs:
                 fi
               done
 
-      - name: Phase 4 - Active Serving & Automated Successor Dispatch
-        env:
-          NEXT_PAT: ${{ secrets.NEXT_PAT }}
-          CLONE_PAT: ${{ secrets.CLONE_PAT }}
+      - name: Phase 4 - Active Serving & Watchdog
         run: |
           set -euo pipefail
           TEST_MIN="${{ github.event.inputs.test_handover }}"
@@ -244,7 +239,7 @@ jobs:
                 pkill -fi aistudio2api || true
                 sleep 3
                 cd aistudio-pro
-                nohup env -u CLONE_PAT -u NEXT_PAT "$BIN_ABS" -listen 0.0.0.0:7865 -auth auth > aistudio.log 2>&1 &
+                nohup "$BIN_ABS" -listen 0.0.0.0:7865 -auth auth > aistudio.log 2>&1 &
                 echo $! > ../server.pid
                 cd ..
                 FAILS=0
@@ -255,32 +250,52 @@ jobs:
             fi
           done
 
-          echo "Pre-handover token sync to preserve refreshed cookies..."
+      - name: Pre-Handover Token Sync
+        env:
+          CLONE_PAT: ${{ secrets.CLONE_PAT }}
+        run: |
+          set +e
           if [ -d "aistudio-pro" ] && [ -n "${CLONE_PAT:-}" ]; then
-            (
-              cd aistudio-pro
-              git config user.name "Silver-kun"
-              git config user.email "silver-kun@users.noreply.github.com"
-              git add auth/ .env 2>/dev/null || true
-              if ! git diff --cached --quiet; then
-                git commit -m "Auto-refresh: update active session tokens (shift complete) [skip ci]" || true
-                git fetch --unshallow "https://x-access-token:${CLONE_PAT}@github.com/Silver-kun/AIStudio2API-Pro.git" main 2>/dev/null \
-                  || git fetch "https://x-access-token:${CLONE_PAT}@github.com/Silver-kun/AIStudio2API-Pro.git" main 2>/dev/null || true
-                git rebase -X ours FETCH_HEAD 2>/dev/null || { git rebase --abort 2>/dev/null || true; }
-                for retry in 1 2 3; do
-                  if git push "https://x-access-token:${CLONE_PAT}@github.com/Silver-kun/AIStudio2API-Pro.git" HEAD:main 2>&1 | sed 's/:[^@]*@/:***@/'; then
-                    echo "Pre-handover tokens successfully pushed to main."
-                    break
-                  fi
-                  echo "Push rejected, retrying ($retry/3)..."; sleep 5
-                  git fetch "https://x-access-token:${CLONE_PAT}@github.com/Silver-kun/AIStudio2API-Pro.git" main 2>/dev/null || true
-                  git rebase -X ours FETCH_HEAD 2>/dev/null || { git rebase --abort 2>/dev/null || true; break; }
-                done
-              fi
-            ) || true
+            echo "Persisting refreshed Google cookies back to private auth vault (pre-handover)..."
+            cd aistudio-pro
+            git config user.name "Silver-kun"
+            git config user.email "silver-kun@users.noreply.github.com"
+            git add auth/ .env 2>/dev/null || true
+            if ! git diff --cached --quiet; then
+              cat > /tmp/git-sync-askpass.sh <<'EOF'
+              #!/bin/sh
+              echo "$SYNC_PAT"
+              EOF
+              chmod 700 /tmp/git-sync-askpass.sh
+              export GIT_ASKPASS=/tmp/git-sync-askpass.sh
+              export GIT_TERMINAL_PROMPT=0
+              export SYNC_PAT="$CLONE_PAT"
+              unset CLONE_PAT
+
+              git commit -m "Auto-refresh: update active session tokens (shift complete) [skip ci]" || true
+              git fetch --unshallow "https://x-access-token@github.com/Silver-kun/AIStudio2API-Pro.git" main 2>/dev/null \
+                || git fetch "https://x-access-token@github.com/Silver-kun/AIStudio2API-Pro.git" main 2>/dev/null || true
+              git rebase -X ours FETCH_HEAD 2>/dev/null || { git rebase --abort 2>/dev/null || true; }
+              for retry in 1 2 3; do
+                if git push "https://x-access-token@github.com/Silver-kun/AIStudio2API-Pro.git" HEAD:main 2>&1 | sed 's/:[^@]*@/:***@/'; then
+                  echo "Pre-handover tokens successfully pushed to main."
+                  break
+                fi
+                echo "Push rejected, retrying ($retry/3)..."; sleep 5
+                git fetch "https://x-access-token@github.com/Silver-kun/AIStudio2API-Pro.git" main 2>/dev/null || true
+                git rebase -X ours FETCH_HEAD 2>/dev/null || { git rebase --abort 2>/dev/null || true; break; }
+              done
+              shred -u /tmp/git-sync-askpass.sh 2>/dev/null || rm -f /tmp/git-sync-askpass.sh
+              unset SYNC_PAT GIT_ASKPASS
+            fi
           fi
 
-          echo "Initiating shift handover to partner node..."
+      - name: Phase 4 Handover Dispatch & Graceful Overlap
+        env:
+          NEXT_PAT: ${{ secrets.NEXT_PAT }}
+        run: |
+          set -euo pipefail
+          TEST_MIN="${{ github.event.inputs.test_handover }}"
           REPOS=("silver-demon61/aistudio-relay" "synth-coder/aistudio-relay")
           CURRENT_INDEX=-1
           for i in "${!REPOS[@]}"; do
@@ -291,6 +306,7 @@ jobs:
           TARGET_REPO="${REPOS[$NEXT_INDEX]}"
           NEXT_CYCLE=$(( ${{ github.event.inputs.cycle_count }} + 1 ))
 
+          echo "Initiating shift handover to partner node: $TARGET_REPO (Cycle $NEXT_CYCLE)..."
           dispatch_runner() {
             local repo="$1"
             local pat="$2"
@@ -326,6 +342,9 @@ jobs:
               -f cycle_count="$NEXT_CYCLE" -f retry_depth="0" -f test_handover="${TEST_MIN:-0}" || true
           fi
 
+          # Unset token as soon as dispatch phase is done
+          unset NEXT_PAT || true
+
           echo "Entering 20-minute graceful handover standby (predecessor continues serving while successor warms up)..."
           sleep 20m
 
@@ -346,24 +365,36 @@ jobs:
           sudo pkill -f cloudflared || true
 
           if [ -d "aistudio-pro" ] && [ -n "${CLONE_PAT:-}" ]; then
-            echo "Persisting refreshed Google cookies back to private auth vault..."
+            echo "Persisting refreshed Google cookies back to private auth vault (teardown)..."
             cd aistudio-pro
             git config user.name "Silver-kun"
             git config user.email "silver-kun@users.noreply.github.com"
             git add auth/ .env 2>/dev/null || true
             if ! git diff --cached --quiet; then
+              cat > /tmp/git-final-askpass.sh <<'EOF'
+              #!/bin/sh
+              echo "$SYNC_PAT"
+              EOF
+              chmod 700 /tmp/git-final-askpass.sh
+              export GIT_ASKPASS=/tmp/git-final-askpass.sh
+              export GIT_TERMINAL_PROMPT=0
+              export SYNC_PAT="$CLONE_PAT"
+              unset CLONE_PAT
+
               git commit -m "Auto-refresh: update active session tokens (teardown) [skip ci]" || true
-              git fetch --unshallow "https://x-access-token:${CLONE_PAT}@github.com/Silver-kun/AIStudio2API-Pro.git" main 2>/dev/null \
-                || git fetch "https://x-access-token:${CLONE_PAT}@github.com/Silver-kun/AIStudio2API-Pro.git" main 2>/dev/null || true
+              git fetch --unshallow "https://x-access-token@github.com/Silver-kun/AIStudio2API-Pro.git" main 2>/dev/null \
+                || git fetch "https://x-access-token@github.com/Silver-kun/AIStudio2API-Pro.git" main 2>/dev/null || true
               git rebase -X ours FETCH_HEAD 2>/dev/null || { git rebase --abort 2>/dev/null || true; }
               for retry in 1 2 3; do
-                if git push "https://x-access-token:${CLONE_PAT}@github.com/Silver-kun/AIStudio2API-Pro.git" HEAD:main 2>&1 | sed 's/:[^@]*@/:***@/'; then
+                if git push "https://x-access-token@github.com/Silver-kun/AIStudio2API-Pro.git" HEAD:main 2>&1 | sed 's/:[^@]*@/:***@/'; then
                   echo "Final tokens successfully pushed to main."
                   break
                 fi
                 echo "Push rejected, retrying ($retry/3)..."; sleep 5
-                git fetch "https://x-access-token:${CLONE_PAT}@github.com/Silver-kun/AIStudio2API-Pro.git" main 2>/dev/null || true
+                git fetch "https://x-access-token@github.com/Silver-kun/AIStudio2API-Pro.git" main 2>/dev/null || true
                 git rebase -X ours FETCH_HEAD 2>/dev/null || { git rebase --abort 2>/dev/null || true; break; }
               done
+              shred -u /tmp/git-final-askpass.sh 2>/dev/null || rm -f /tmp/git-final-askpass.sh
+              unset SYNC_PAT GIT_ASKPASS
             fi
           fi
