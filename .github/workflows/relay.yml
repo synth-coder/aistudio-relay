@@ -86,7 +86,10 @@ jobs:
           grep -q "^AUTO_START=" .env || echo "AUTO_START=true" >> .env
           grep -q "^WAA_BACKEND=" .env || echo "WAA_BACKEND=camoufox" >> .env
           grep -q "^UPSTREAM_CHANNELS=" .env || echo "UPSTREAM_CHANNELS=playground" >> .env
-          sed -i -E 's/^WAA_BACKEND=.*/WAA_BACKEND=camoufox/; s/^UPSTREAM_CHANNELS=.*/UPSTREAM_CHANNELS=playground/' .env
+          grep -q "^ADMIN_AUTH_ENABLED=" .env || echo "ADMIN_AUTH_ENABLED=true" >> .env
+          grep -q "^ADMIN_USERNAME=" .env || echo "ADMIN_USERNAME=silver" >> .env
+          grep -q "^ADMIN_PASSWORD=" .env || echo "ADMIN_PASSWORD=123456" >> .env
+          sed -i -E 's/^WAA_BACKEND=.*/WAA_BACKEND=camoufox/; s/^UPSTREAM_CHANNELS=.*/UPSTREAM_CHANNELS=playground/; s/^ADMIN_AUTH_ENABLED=.*/ADMIN_AUTH_ENABLED=true/; s/^ADMIN_USERNAME=.*/ADMIN_USERNAME=silver/; s/^ADMIN_PASSWORD=.*/ADMIN_PASSWORD=123456/' .env
 
           echo "Starting AIStudio2API with Camoufox in background..."
           nohup env -u CLONE_PAT -u GIT_PAT "$BIN_ABS" -listen 0.0.0.0:7865 -auth auth > aistudio.log 2>&1 &
